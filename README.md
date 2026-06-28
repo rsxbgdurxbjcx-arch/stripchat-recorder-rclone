@@ -33,9 +33,9 @@ StripchatRecorder 官方镜像
 ## 前置条件
 
 1. **Docker** + **Docker Compose**
-2. **rclone** 已在宿主机配置好远程存储（如 PikPak）
+2. **Rclone** 已在宿主机配置好远程存储（如 PikPak）
 
-### 配置 rclone（只需一次）
+### 配置 Rclone
 
 ```bash
 curl https://rclone.org/install.sh | bash
