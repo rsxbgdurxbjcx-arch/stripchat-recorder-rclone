@@ -46,11 +46,11 @@ curl https://rclone.org/install.sh | bash
 # 配置远程存储
 rclone config
 ```
-# → n（新建远程）
-# → 名字: pikpak（或其他名字）
-# → 选择 pikpak
-# → 输入用户名和密码
-# → y 确认
+### → n（新建远程）
+### → 名字: pikpak（或其他名字）
+### → 选择 pikpak
+### → 输入用户名和密码
+### → y 确认
 
 ```bash
 # 验证
