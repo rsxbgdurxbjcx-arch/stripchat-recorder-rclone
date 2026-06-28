@@ -1,0 +1,18 @@
+services:
+  stripchat-recorder:
+    image: ghcr.io/rsxbgdurxbjcx-arch/stripchat-recorder-rclone:latest
+    container_name: stripchat-recorder
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      # - LANGUAGE=en-US
+      # - PORT=3030
+    ports:
+      - "${PORT:-3030}:${PORT:-3030}"
+    volumes:
+      - ./data/logs:/app/stripchat-recorder/logs
+      - ./data/recordings:/app/stripchat-recorder/recordings
+      - ./data/modules:/app/stripchat-recorder/modules
+      - ./data/config:/app/stripchat-recorder/config
+      # rclone 配置目录（宿主机配置好 rclone 后挂载进去）
+      - ./data/rclone:/root/.config/rclone
