@@ -22,7 +22,7 @@ StripchatRecorder 官方镜像
 
 ## 功能
 
-- 通过 rclone 上传视频至任意支持的云盘（PikPak、Google Drive、OneDrive 等）
+- 通过 Rclone 上传视频至任意支持的云盘（PikPak、Google Drive、OneDrive 等）
 - 自动从文件名提取主播名，在云盘按主播名创建子文件夹
 - 上传失败自动重试
 - 可选上传成功后删除本地文件
