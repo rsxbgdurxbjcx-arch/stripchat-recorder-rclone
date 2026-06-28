@@ -47,10 +47,15 @@ rclone config
 
 > 按提示操作：
 > - 输入 `n` 新建远程
-> - 名字填 `pikpak`（或其他名字）
-> - 选择 `pikpak`
-> - 输入 PikPak 用户名和密码
+> - 名字填 `pikpak`（或其他云盘）
+> - 输入 `pikpak`
+> - 输入 PikPak账号
 > - 输入 `y` 确认
+> - 输入PikPak密码
+> - 再次输入密码
+> - 输入 `n` 跳过高级配置
+> - 输入 `y` 确认
+> - 输入 `q` 退出
 
 ```bash
 rclone lsd pikpak:
