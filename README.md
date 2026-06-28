@@ -22,7 +22,7 @@ StripchatRecorder 官方镜像
 
 ## 功能
 
-- 通过 rclone 上传视频至任意rclone支持的云盘（PikPak、Google Drive、OneDrive 等）
+- 通过 rclone 上传视频至任意支持的云盘（PikPak、Google Drive、OneDrive 等）
 - 自动从文件名提取主播名，在云盘按主播名创建子文件夹
 - 上传失败自动重试
 - 可选上传成功后删除本地文件
@@ -38,24 +38,25 @@ StripchatRecorder 官方镜像
 ### 配置 rclone（只需一次）
 
 ```bash
-# 安装 rclone
 curl https://rclone.org/install.sh | bash
 ```
 
 ```bash
-# 配置远程存储
 rclone config
 ```
-### → n（新建远程）
-### → 名字: pikpak（或其他名字）
-### → 选择 pikpak
-### → 输入用户名和密码
-### → y 确认
+
+> 按提示操作：
+> - 输入 `n` 新建远程
+> - 名字填 `pikpak`（或其他名字）
+> - 选择 `pikpak`
+> - 输入 PikPak 用户名和密码
+> - 输入 `y` 确认
 
 ```bash
-# 验证
 rclone lsd pikpak:
 ```
+
+> 能列出云盘目录即配置成功。
 
 ---
 
@@ -65,18 +66,23 @@ rclone lsd pikpak:
 
 ```bash
 mkdir -p /opt/stripchat-recorder-rclone
-cd /opt/stripchat-recorder-rclone
+```
 
-curl -o docker-compose.yml \
-  https://raw.githubusercontent.com/rsxbgdurxbjcx-arch/stripchat-recorder-rclone/main/docker-compose.yml
+```bash
+cd /opt/stripchat-recorder-rclone
+```
+
+```bash
+curl -o docker-compose.yml https://raw.githubusercontent.com/rsxbgdurxbjcx-arch/stripchat-recorder-rclone/main/docker-compose.yml
 ```
 
 ### 2. 准备目录
 
 ```bash
 mkdir -p data/{logs,recordings,modules,config,rclone}
+```
 
-# 将宿主机的 rclone 配置复制进来
+```bash
 cp /root/.config/rclone/rclone.conf data/rclone/
 ```
 
@@ -84,18 +90,27 @@ cp /root/.config/rclone/rclone.conf data/rclone/
 
 ```bash
 docker compose pull
+```
+
+```bash
 docker compose up -d
 ```
+
+> **如果之前部署过 StripchatRecorder 官方镜像**，会报容器名冲突。先执行以下命令清理旧容器：
+>
+> ```bash
+> docker stop stripchat-recorder 2>/dev/null; docker rm stripchat-recorder 2>/dev/null
+> ```
+>
+> 然后重新执行 `docker compose up -d`。
 
 ### 4. 验证
 
 ```bash
-# 查看日志
-docker logs -f stripchat-recorder
-
-# 浏览器访问 Web UI
-# http://服务器IP:3030/
+docker logs -f sr-rclone
 ```
+
+> 浏览器访问 `http://服务器IP:3030/` 打开 Web UI。
 
 ---
 
@@ -141,7 +156,7 @@ testmodel_20260625_071400.mp4
 services:
   stripchat-recorder:
     image: ghcr.io/rsxbgdurxbjcx-arch/stripchat-recorder-rclone:latest
-    container_name: stripchat-recorder
+    container_name: sr-rclone
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
@@ -162,10 +177,19 @@ services:
 ## 常用命令
 
 ```bash
-docker logs -f stripchat-recorder              # 查看日志
-docker compose restart                         # 重启
-docker compose down                            # 停止
-docker compose pull && docker compose up -d    # 更新到最新镜像
+docker logs -f sr-rclone
+```
+
+```bash
+docker compose restart
+```
+
+```bash
+docker compose down
+```
+
+```bash
+docker compose pull && docker compose up -d
 ```
 
 ---
