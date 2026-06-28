@@ -62,54 +62,35 @@ rclone lsd pikpak:
 
 ## 安装部署
 
-### 1. 下载 docker-compose.yml
+### 1. 下载 docker-compose.yml 并准备目录
 
 ```bash
-mkdir -p /opt/stripchat-recorder-rclone
+mkdir -p /opt/stripchat-recorder-rclone && cd /opt/stripchat-recorder-rclone && curl -o docker-compose.yml https://raw.githubusercontent.com/rsxbgdurxbjcx-arch/stripchat-recorder-rclone/main/docker-compose.yml && mkdir -p data/{logs,recordings,modules,config,rclone} && cp /root/.config/rclone/rclone.conf data/rclone/
 ```
 
-```bash
-cd /opt/stripchat-recorder-rclone
-```
-
-```bash
-curl -o docker-compose.yml https://raw.githubusercontent.com/rsxbgdurxbjcx-arch/stripchat-recorder-rclone/main/docker-compose.yml
-```
-
-### 2. 准备目录
-
-```bash
-mkdir -p data/{logs,recordings,modules,config,rclone}
-```
-
-```bash
-cp /root/.config/rclone/rclone.conf data/rclone/
-```
-
-### 3. 启动
-
-```bash
-docker compose pull
-```
-
-```bash
-docker compose up -d
-```
-
-> **如果之前部署过 StripchatRecorder 官方镜像**，会报容器名冲突。先执行以下命令清理旧容器：
+> 如果之前部署过 StripchatRecorder 官方镜像，先清理旧容器避免端口冲突：
 >
 > ```bash
 > docker stop stripchat-recorder 2>/dev/null; docker rm stripchat-recorder 2>/dev/null
 > ```
->
-> 然后重新执行 `docker compose up -d`。
 
-### 4. 验证
+### 2. 拉取镜像并启动
+
+```bash
+cd /opt/stripchat-recorder-rclone && docker compose pull && docker compose up -d
+```
+
+### 3. 验证
 
 ```bash
 docker logs -f sr-rclone
 ```
 
+> 看到以下日志说明启动成功：
+> ```
+> Server mode: listening on http://0.0.0.0:3030
+> ```
+>
 > 浏览器访问 `http://服务器IP:3030/` 打开 Web UI。
 
 ---
@@ -150,6 +131,34 @@ testmodel_20260625_071400.mp4
 
 ---
 
+## 更新镜像
+
+当仓库有更新时，拉取最新镜像并重启：
+
+```bash
+cd /opt/stripchat-recorder-rclone && docker compose pull && docker compose up -d
+```
+
+---
+
+## 常用命令
+
+> 以下命令都需要先 `cd /opt/stripchat-recorder-rclone` 进入部署目录。
+
+```bash
+docker logs -f sr-rclone
+```
+
+```bash
+docker compose restart
+```
+
+```bash
+docker compose down
+```
+
+---
+
 ## docker-compose.yml 参考
 
 ```yaml
@@ -171,26 +180,6 @@ services:
 ```
 
 如需修改端口，添加 `PORT` 环境变量或创建 `.env` 文件。
-
----
-
-## 常用命令
-
-```bash
-docker logs -f sr-rclone
-```
-
-```bash
-docker compose restart
-```
-
-```bash
-docker compose down
-```
-
-```bash
-docker compose pull && docker compose up -d
-```
 
 ---
 
