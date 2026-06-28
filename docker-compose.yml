@@ -1,7 +1,7 @@
 services:
   stripchat-recorder:
     image: ghcr.io/rsxbgdurxbjcx-arch/stripchat-recorder-rclone:latest
-    container_name: stripchat-recorder
+    container_name: sr-rclone
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
