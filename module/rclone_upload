@@ -249,7 +249,7 @@ def upload_file(
         stderr_lines.append(line)
 
         # rclone --progress 输出格式（用 \r 原地刷新）:
-        #   Transferred:   	   1.234 GiB / 17.710 GiB, 7%, 2.345 MiB/s, ETA 1m23s
+        #   Transferred:           1.234 GiB / 17.710 GiB, 7%, 2.345 MiB/s, ETA 1m23s
         #   checks:                 0 / 0, 0%
         #   transferred:            0 / 1, 0%
         # 只从 "Transferred:" 行提取进度和速度
@@ -286,11 +286,14 @@ def upload_file(
         # 这样既不会阻塞卡死，也能每秒检查进程状态
         readable, _, _ = select.select([stderr_fd, stdout_fd], [], [], 1.0)
 
+        got_data = False
+
         # 读取 stderr（rclone --progress 的输出在 stderr）
         if stderr_fd in readable:
             try:
                 chunk = os.read(stderr_fd, 65536).decode("utf-8", errors="replace")
                 if chunk:
+                    got_data = True
                     stderr_buffer += chunk
                     # 按 \r 或 \n 分割成行（rclone --progress 用 \r 刷新进度）
                     parts = re.split(r"[\r\n]+", stderr_buffer)
@@ -305,23 +308,16 @@ def upload_file(
             try:
                 chunk = os.read(stdout_fd, 65536)
                 if chunk:
+                    got_data = True
                     text = chunk.decode("utf-8", errors="replace").strip()
                     if text:
                         sys.stderr.write(f"rclone stdout: {text}\n")
             except BlockingIOError:
                 pass
 
-        # 进程结束后读取剩余数据
-        if proc.poll() is not None and not readable:
-            try:
-                remaining = os.read(stderr_fd, 65536).decode(
-                    "utf-8", errors="replace"
-                )
-                if remaining:
-                    stderr_buffer += remaining
-            except BlockingIOError:
-                pass
-
+        # 进程结束且无更多数据可读时退出
+        # （got_data=False 表示所有管道已到 EOF，数据已全部读取完毕）
+        if proc.poll() is not None and not got_data:
             # 处理缓冲区中最后的残留数据
             if stderr_buffer.strip():
                 process_line(stderr_buffer)
