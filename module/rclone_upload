@@ -3,12 +3,12 @@
 """
 Rclone 上传后处理模块 / Rclone Upload Post-processing Module
 
-通过 rclone 将录制完成的视频上传至 PikPak 云盘。
+通过 rclone 将录制完成的视频上传至 PikPak 等云盘。
 - 自动从文件名提取主播名（去除 _YYYYMMDD_HHMMSS 后缀）
 - 在远程目录下按主播名创建子文件夹
 - 支持重试机制
 - 上传成功后可选删除本地文件
-- 通过 stdout 协议上报进度
+- 通过 stdout 协议上报进度和速度
 
 协议 / Protocol:
   --describe           输出模块元数据 JSON
@@ -16,7 +16,7 @@ Rclone 上传后处理模块 / Rclone Upload Post-processing Module
   PP_PARAM_* 环境变量   模块参数
   stdout: OUTPUT:path   成功后输出视频路径
   stdout: PROGRESS:d/t  进度上报 (total=10000)
-  stdout: STATUS:text   状态文字
+  stdout: STATUS:text   状态文字（含上传速度）
   stdout: DELETE_INPUT  请求主程序删除输入文件
 """
 
@@ -26,12 +26,14 @@ import re
 import json
 import subprocess
 import time
+import select
+import fcntl
 
 PROGRESS_SCALE = 10000
 
 DESCRIBE = {
     "id": "rclone_upload",
-    "name": "Rclone 上传 0.1.0",
+    "name": "Rclone 上传 0.2.0",
     "description": "通过 rclone 将视频上传至 PikPak 等云盘，自动按主播名分类存储",
     "params": [
         {
@@ -73,7 +75,7 @@ DESCRIBE = {
     ],
     "i18n": {
         "en-US": {
-            "name": "Rclone Upload 0.1.0",
+            "name": "Rclone Upload 0.2.0",
             "description": "Upload videos to cloud storage via rclone, auto-categorized by streamer name",
             "params": {
                 "remote_name": {"label": "Rclone Remote Name"},
@@ -138,6 +140,16 @@ def param_bool(key: str, default: bool) -> bool:
     return param(key, str(default)).lower() in ("true", "1", "yes", "on")
 
 
+def format_file_size(size_bytes: int) -> str:
+    """将字节数格式化为人类可读的字符串"""
+    size = float(size_bytes)
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PiB"
+
+
 def ensure_remote_folder(rclone_path: str, remote: str, base_dir: str, folder_name: str):
     """确保远程目录存在"""
     remote_path = f"{remote}:{base_dir}/{folder_name}"
@@ -165,8 +177,23 @@ def upload_file(
     folder_name: str,
     transfers: int,
 ):
-    """使用 rclone copyto 上传文件，实时解析进度"""
+    """
+    使用 rclone copyto 上传文件，实时解析进度。
+
+    核心修复：
+    1. 使用 select + os.read 非阻塞读取 stderr，正确处理 rclone --progress 的 \\r 刷新
+       （旧代码用 readline() 只能读 \\n 结尾的行，导致 \\r 刷新的进度数据堆积在管道
+       缓冲区，64KB 满后 rclone write() 阻塞，大文件上传卡死）
+    2. 正则匹配 rclone 实际输出格式（旧代码期望带括号的百分比，但 rclone 用逗号分隔）
+    3. 添加 --retries --low-level-retries --timeout 提升大文件上传可靠性
+    """
     remote_dest = f"{remote}:{base_dir}/{folder_name}/{os.path.basename(local_path)}"
+    file_size = os.path.getsize(local_path)
+
+    sys.stderr.write(
+        f"[rclone_upload] file={os.path.basename(local_path)} "
+        f"size={format_file_size(file_size)} dest={remote_dest}\n"
+    )
 
     cmd = [
         rclone_path,
@@ -179,7 +206,12 @@ def upload_file(
         "--stats",
         "1s",
         "--no-traverse",
-        "--verbose",
+        "--retries",
+        "3",
+        "--low-level-retries",
+        "20",
+        "--timeout",
+        "300s",
     ]
 
     try:
@@ -187,9 +219,7 @@ def upload_file(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
+            bufsize=0,
         )
     except Exception as e:
         return False, f"Failed to spawn rclone: {e}"
@@ -197,37 +227,106 @@ def upload_file(
     last_progress = 0
     stderr_lines = []
 
-    while True:
-        line = proc.stderr.readline()
+    # 将 stderr 和 stdout 的文件描述符设为非阻塞模式
+    # 这样可以用 select 多路复用读取，不会卡在 read() 上
+    stderr_fd = proc.stderr.fileno()
+    fl = fcntl.fcntl(stderr_fd, fcntl.F_GETFL)
+    fcntl.fcntl(stderr_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+    stdout_fd = proc.stdout.fileno()
+    fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
+    fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+    stderr_buffer = ""
+
+    def process_line(line: str):
+        """解析一行 rclone 输出，提取进度和速度"""
+        nonlocal last_progress
+        line = line.strip()
         if not line:
-            if proc.poll() is not None:
-                break
-            continue
+            return
 
-        stderr_lines.append(line.rstrip())
-        line_stripped = line.strip()
+        stderr_lines.append(line)
 
-        # 解析 rclone 进度: Transferred 123.456 MiB / 789.012 MiB (15.6%), 2.3 MiB/s, ETA 4m30s
-        progress_match = re.search(
-            r"Transferred\s+[\d.]+\s*\w+\s*/\s*[\d.]+\s*\w+\s*\(([\d.]+)%\)",
-            line_stripped,
-        )
-        if progress_match:
+        # rclone --progress 输出格式（用 \r 原地刷新）:
+        #   Transferred:   	   1.234 GiB / 17.710 GiB, 7%, 2.345 MiB/s, ETA 1m23s
+        #   checks:                 0 / 0, 0%
+        #   transferred:            0 / 1, 0%
+        # 只从 "Transferred:" 行提取进度和速度
+        if "Transferred" in line and "%" in line:
+            # 提取百分比（匹配 "7%" 或 "7.5%"）
+            pct_match = re.search(r"([\d.]+)\s*%", line)
+            if pct_match:
+                try:
+                    pct = float(pct_match.group(1))
+                    progress = int(pct * PROGRESS_SCALE / 100.0)
+                    if progress > last_progress:
+                        last_progress = progress
+                        emit_progress(progress)
+                except ValueError:
+                    pass
+
+            # 提取上传速度（匹配 "2.345 MiB/s" 或 "2.345 M/s" 等）
+            speed_match = re.search(
+                r"([\d.]+\s*(?:KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/s)",
+                line,
+            )
+
+            pct_str = pct_match.group(1) if pct_match else "?"
+            if speed_match:
+                emit_status(f"正在上传... {pct_str}% ↑ {speed_match.group(1)}")
+            else:
+                emit_status(f"正在上传... {pct_str}%")
+
+        if "ERROR" in line or "Failed" in line or "error" in line.lower():
+            sys.stderr.write(f"rclone: {line}\n")
+
+    while True:
+        # 用 select 多路复用等待 stderr/stdout 可读，1 秒超时
+        # 这样既不会阻塞卡死，也能每秒检查进程状态
+        readable, _, _ = select.select([stderr_fd, stdout_fd], [], [], 1.0)
+
+        # 读取 stderr（rclone --progress 的输出在 stderr）
+        if stderr_fd in readable:
             try:
-                pct = float(progress_match.group(1))
-                progress = int(pct * PROGRESS_SCALE / 100.0)
-                if progress > last_progress:
-                    last_progress = progress
-                    emit_progress(progress)
-            except ValueError:
+                chunk = os.read(stderr_fd, 65536).decode("utf-8", errors="replace")
+                if chunk:
+                    stderr_buffer += chunk
+                    # 按 \r 或 \n 分割成行（rclone --progress 用 \r 刷新进度）
+                    parts = re.split(r"[\r\n]+", stderr_buffer)
+                    stderr_buffer = parts[-1]  # 最后一段可能不完整，保留
+                    for part in parts[:-1]:
+                        process_line(part)
+            except BlockingIOError:
                 pass
 
-            speed_match = re.search(r"([\d.]+\s*\w+/s)", line_stripped)
-            if speed_match:
-                emit_status(f"↑ {speed_match.group(1)}")
+        # 排空 stdout（防止 stdout 缓冲区满导致 rclone 阻塞）
+        if stdout_fd in readable:
+            try:
+                chunk = os.read(stdout_fd, 65536)
+                if chunk:
+                    text = chunk.decode("utf-8", errors="replace").strip()
+                    if text:
+                        sys.stderr.write(f"rclone stdout: {text}\n")
+            except BlockingIOError:
+                pass
 
-        if "ERROR" in line_stripped or "error" in line_stripped.lower():
-            sys.stderr.write(f"rclone: {line_stripped}\n")
+        # 进程结束后读取剩余数据
+        if proc.poll() is not None and not readable:
+            try:
+                remaining = os.read(stderr_fd, 65536).decode(
+                    "utf-8", errors="replace"
+                )
+                if remaining:
+                    stderr_buffer += remaining
+            except BlockingIOError:
+                pass
+
+            # 处理缓冲区中最后的残留数据
+            if stderr_buffer.strip():
+                process_line(stderr_buffer)
+                stderr_buffer = ""
+            break
 
     proc.wait()
 
@@ -235,9 +334,20 @@ def upload_file(
         emit_progress(PROGRESS_SCALE)
         return True, "Upload OK"
     else:
-        error_msg = "\n".join(l for l in stderr_lines if "ERROR" in l or "error" in l.lower())
-        if not error_msg:
-            error_msg = "\n".join(stderr_lines[-5:]) if stderr_lines else f"rclone exit {proc.returncode}"
+        error_lines = [
+            l
+            for l in stderr_lines
+            if "ERROR" in l or "error" in l.lower() or "Failed" in l
+        ]
+        error_msg = (
+            "\n".join(error_lines)
+            if error_lines
+            else (
+                "\n".join(stderr_lines[-5:])
+                if stderr_lines
+                else f"rclone exit {proc.returncode}"
+            )
+        )
         return False, error_msg
 
 
@@ -264,17 +374,19 @@ def run():
     if not streamer_name:
         streamer_name = "unknown"
 
+    file_size = os.path.getsize(input_path)
+
     sys.stderr.write(
         f"[rclone_upload] file={input_path}, streamer={streamer_name}, "
+        f"size={format_file_size(file_size)}, "
         f"target={remote_name}:{base_dir}/{streamer_name}/\n"
     )
 
     emit_progress(0)
-    emit_status(f"准备上传至 {streamer_name}/")
+    emit_status(f"准备上传 {format_file_size(file_size)} 至 {streamer_name}/")
 
     ensure_remote_folder(rclone_path, remote_name, base_dir, streamer_name)
 
-    emit_progress(100)
     emit_status("正在上传...")
 
     last_error = ""
@@ -291,19 +403,23 @@ def run():
                 print("DELETE_INPUT", flush=True)
             else:
                 emit_output(input_path)
-            sys.stderr.write(f"Upload success: {input_path} -> {remote_name}:{base_dir}/{streamer_name}/\n")
+            sys.stderr.write(
+                f"Upload success: {input_path} -> "
+                f"{remote_name}:{base_dir}/{streamer_name}/\n"
+            )
             return
 
         last_error = message
         if attempt < max_retries:
             wait_time = 10 * attempt
             emit_status(f"重试中 ({attempt}/{max_retries})，{wait_time}s 后重试...")
-            sys.stderr.write(f"Upload failed (attempt {attempt}/{max_retries}): {message}\n")
+            sys.stderr.write(
+                f"Upload failed (attempt {attempt}/{max_retries}): {message}\n"
+            )
             time.sleep(wait_time)
 
     emit_status("上传失败 ✗")
     sys.stderr.write(f"Upload failed after {max_retries} attempts: {last_error}\n")
-    print(f"Rclone 上传失败: {last_error}", flush=True)
     emit_output(input_path)
     sys.exit(1)
 
