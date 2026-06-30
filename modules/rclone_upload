@@ -33,7 +33,7 @@ PROGRESS_SCALE = 10000
 
 DESCRIBE = {
     "id": "rclone_upload",
-    "name": "Rclone 上传 0.4.0",
+    "name": "Rclone 上传 0.4.1",
     "description": "通过 rclone 将视频上传至 PikPak 等云盘，自动按主播名分类存储",
     "params": [
         {
@@ -75,7 +75,7 @@ DESCRIBE = {
     ],
     "i18n": {
         "en-US": {
-            "name": "Rclone Upload 0.4.0",
+            "name": "Rclone Upload 0.4.1",
             "description": "Upload videos to cloud storage via rclone, auto-categorized by streamer name",
             "params": {
                 "remote_name": {"label": "Rclone Remote Name"},
@@ -148,6 +148,40 @@ def format_file_size(size_bytes: int) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024
     return f"{size:.2f} PiB"
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    """
+    格式化上传速度，与 SR Telegram 模块 pp_utils::format_speed 保持一致。
+    Format upload speed, matching SR Telegram module pp_utils::format_speed.
+    """
+    if bytes_per_sec >= 1024.0 * 1024.0:
+        return f"↑ {bytes_per_sec / (1024.0 * 1024.0):.1f} MB/s"
+    elif bytes_per_sec >= 1024.0:
+        return f"↑ {bytes_per_sec / 1024.0:.1f} KB/s"
+    else:
+        return f"↑ {bytes_per_sec:.0f} B/s"
+
+
+def parse_speed_to_bps(speed_str: str) -> float | None:
+    """
+    将 rclone 输出的速度字符串（如 "2.345 MiB/s"）转换为 bytes/sec。
+    Convert rclone speed string (e.g. "2.345 MiB/s") to bytes/sec.
+    """
+    m = re.match(
+        r"([\d.]+)\s*(KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/s",
+        speed_str.strip(),
+    )
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2)
+    multipliers = {
+        "B": 1,
+        "KB": 1000, "MB": 1000000, "GB": 1000000000, "TB": 1000000000000,
+        "KiB": 1024, "MiB": 1024 * 1024, "GiB": 1024 * 1024 * 1024, "TiB": 1024 * 1024 * 1024 * 1024,
+    }
+    return val * multipliers.get(unit, 1)
 
 
 def ensure_remote_folder(rclone_path: str, remote: str, base_dir: str, folder_name: str):
@@ -235,11 +269,10 @@ def upload_file(
     last_progress = 0
     stderr_lines = []
     stderr_buffer = ""
-    last_speed = ""
 
     def process_line(line: str):
         """解析一行 rclone 输出，提取进度和速度"""
-        nonlocal last_progress, last_speed
+        nonlocal last_progress
 
         # 去除 ANSI 转义序列（终端颜色/光标移动等）
         line = _ANSI_ESCAPE.sub('', line)
@@ -256,7 +289,7 @@ def upload_file(
         #   Elapsed time:        10.0s
         # 只从含 "Transferred" + "%" + "/s" 的字节行提取进度和速度
         if "Transferred" in line and "%" in line and "/s" in line:
-            # ── 提取百分比 → PROGRESS ──
+            # ── 提取百分比 → PROGRESS（驱动进度条，SR 前端自己算百分比）──
             pct_match = re.search(r"([\d.]+)\s*%", line)
             if pct_match:
                 try:
@@ -268,21 +301,16 @@ def upload_file(
                 except ValueError:
                     pass
 
-            # ── 提取上传速度 → STATUS ──
+            # ── 提取上传速度 → STATUS（只输出速度，不输出百分比）──
+            # 与 Telegram 模块保持一致：STATUS 只有速度，百分比由 PROGRESS 驱动
             speed_match = re.search(
                 r"([\d.]+\s*(?:KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB|B)/s)",
                 line,
             )
             if speed_match:
-                last_speed = speed_match.group(1).strip()
-            # STATUS 同时显示百分比和速度
-            pct_str = pct_match.group(1) if pct_match else ""
-            if last_speed:
-                emit_status(f"正在上传... {pct_str}% ↑ {last_speed}")
-            elif pct_str:
-                emit_status(f"正在上传... {pct_str}%")
-            else:
-                emit_status("正在上传...")
+                bps = parse_speed_to_bps(speed_match.group(1))
+                if bps is not None:
+                    emit_status(format_speed(bps))
 
         if "ERROR" in line or "Failed" in line or "error" in line.lower():
             sys.stderr.write(f"rclone: {line}\n")
