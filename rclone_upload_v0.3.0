@@ -33,7 +33,7 @@ PROGRESS_SCALE = 10000
 
 DESCRIBE = {
     "id": "rclone_upload",
-    "name": "Rclone 上传 0.2.0",
+    "name": "Rclone 上传 0.3.0",
     "description": "通过 rclone 将视频上传至 PikPak 等云盘，自动按主播名分类存储",
     "params": [
         {
@@ -75,7 +75,7 @@ DESCRIBE = {
     ],
     "i18n": {
         "en-US": {
-            "name": "Rclone Upload 0.2.0",
+            "name": "Rclone Upload 0.3.0",
             "description": "Upload videos to cloud storage via rclone, auto-categorized by streamer name",
             "params": {
                 "remote_name": {"label": "Rclone Remote Name"},
@@ -169,6 +169,36 @@ def ensure_remote_folder(rclone_path: str, remote: str, base_dir: str, folder_na
         return False
 
 
+# ── pty 辅助 ──
+# rclone --progress 检测到 stderr 是管道（非终端）时，会抑制实时进度输出。
+# 用伪终端（pty）作为 rclone 的 stderr，让 rclone 以为在向终端输出，
+# 从而实时用 \r 刷新进度行（含百分比和上传速度）。
+
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b[()][AB012]')
+
+
+def _create_pty():
+    """
+    创建一个伪终端对，返回 (master_fd, slave_fd)。
+    失败时返回 (None, None)。
+    """
+    try:
+        import pty as _pty
+        import termios
+        master_fd, slave_fd = _pty.openpty()
+        # 禁用 echo 和 ONLCR（避免 \n 被转成 \r\n 干扰解析）
+        try:
+            attrs = termios.tcgetattr(master_fd)
+            attrs[3] = attrs[3] & ~termios.ECHO       # lflag: disable ECHO
+            attrs[1] = attrs[1] & ~termios.ONLCR       # oflag: don't convert \n→\r\n
+            termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
+        except (OSError, IOError):
+            pass  # 非致命，继续使用默认 pty 设置
+        return master_fd, slave_fd
+    except (ImportError, OSError):
+        return None, None
+
+
 def upload_file(
     rclone_path: str,
     local_path: str,
@@ -180,12 +210,13 @@ def upload_file(
     """
     使用 rclone copyto 上传文件，实时解析进度。
 
-    核心修复：
-    1. 使用 select + os.read 非阻塞读取 stderr，正确处理 rclone --progress 的 \\r 刷新
-       （旧代码用 readline() 只能读 \\n 结尾的行，导致 \\r 刷新的进度数据堆积在管道
-       缓冲区，64KB 满后 rclone write() 阻塞，大文件上传卡死）
-    2. 正则匹配 rclone 实际输出格式（旧代码期望带括号的百分比，但 rclone 用逗号分隔）
-    3. 添加 --retries --low-level-retries --timeout 提升大文件上传可靠性
+    核心修复（v0.3.0）：
+    1. 用 pty（伪终端）作为 rclone 的 stderr → rclone 认为在向终端输出
+       → 实时输出进度行（含百分比 + 上传速度），不再缓冲或抑制
+       → 解决了「进度条不更新、速度不显示」的根本原因
+    2. pty 不可用时回退到管道模式（select + os.read 非阻塞）
+    3. STATUS 同时显示百分比和上传速度（如 "正在上传... 50% ↑ 3.200 MiB/s"）
+    4. 添加 --retries --low-level-retries --timeout 提升大文件上传可靠性
     """
     remote_dest = f"{remote}:{base_dir}/{folder_name}/{os.path.basename(local_path)}"
     file_size = os.path.getsize(local_path)
@@ -214,47 +245,74 @@ def upload_file(
         "300s",
     ]
 
+    # ── 创建 pty ──
+    master_fd, slave_fd = _create_pty()
+    use_pty = master_fd is not None
+
+    if use_pty:
+        sys.stderr.write("[rclone_upload] using pty for rclone stderr\n")
+    else:
+        sys.stderr.write("[rclone_upload] pty unavailable, falling back to pipe\n")
+
+    # ── 启动 rclone ──
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        if use_pty:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=slave_fd,
+                bufsize=0,
+            )
+            os.close(slave_fd)  # 父进程关闭 slave 端（子进程已继承）
+            err_fd = master_fd
+        else:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            err_fd = proc.stderr.fileno()
     except Exception as e:
+        if use_pty:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
         return False, f"Failed to spawn rclone: {e}"
 
-    last_progress = 0
-    stderr_lines = []
-
-    # 将 stderr 和 stdout 的文件描述符设为非阻塞模式
-    # 这样可以用 select 多路复用读取，不会卡在 read() 上
-    stderr_fd = proc.stderr.fileno()
-    fl = fcntl.fcntl(stderr_fd, fcntl.F_GETFL)
-    fcntl.fcntl(stderr_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    # ── 设置非阻塞读取 ──
+    fl = fcntl.fcntl(err_fd, fcntl.F_GETFL)
+    fcntl.fcntl(err_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
     stdout_fd = proc.stdout.fileno()
     fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL)
     fcntl.fcntl(stdout_fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
+    last_progress = 0
+    stderr_lines = []
     stderr_buffer = ""
+    last_speed = ""
 
     def process_line(line: str):
         """解析一行 rclone 输出，提取进度和速度"""
-        nonlocal last_progress
+        nonlocal last_progress, last_speed
+
+        # 去除 ANSI 转义序列（终端颜色/光标移动等）
+        line = _ANSI_ESCAPE.sub('', line)
         line = line.strip()
         if not line:
             return
 
         stderr_lines.append(line)
 
-        # rclone --progress 输出格式（用 \r 原地刷新）:
-        #   Transferred:           1.234 GiB / 17.710 GiB, 7%, 2.345 MiB/s, ETA 1m23s
+        # rclone --progress 输出格式:
+        #   Transferred:           1.771 GiB / 17.710 GiB, 10%, 2.345 MiB/s, ETA 1m23s
         #   checks:                 0 / 0, 0%
         #   transferred:            0 / 1, 0%
-        # 只从 "Transferred:" 行提取进度和速度
+        # 只从含 "Transferred" 和 "%" 的行提取进度和速度
         if "Transferred" in line and "%" in line:
-            # 提取百分比（匹配 "7%" 或 "7.5%"）
+            # ── 提取百分比 → PROGRESS ──
             pct_match = re.search(r"([\d.]+)\s*%", line)
             if pct_match:
                 try:
@@ -266,41 +324,49 @@ def upload_file(
                 except ValueError:
                     pass
 
-            # 提取上传速度（匹配 "2.345 MiB/s" 或 "2.345 M/s" 等）
+            # ── 提取上传速度 → STATUS ──
+            # 匹配 "2.345 MiB/s", "795.6 KB/s", "1.2 GiB/s" 等
             speed_match = re.search(
-                r"([\d.]+\s*(?:KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)/s)",
+                r"([\d.]+\s*(?:KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB|B)/s)",
                 line,
             )
-
-            pct_str = pct_match.group(1) if pct_match else "?"
             if speed_match:
-                emit_status(f"正在上传... {pct_str}% ↑ {speed_match.group(1)}")
-            else:
+                last_speed = speed_match.group(1).strip()
+            # STATUS 同时显示百分比和速度
+            pct_str = pct_match.group(1) if pct_match else ""
+            if last_speed:
+                emit_status(f"正在上传... {pct_str}% ↑ {last_speed}")
+            elif pct_str:
                 emit_status(f"正在上传... {pct_str}%")
+            else:
+                emit_status("正在上传...")
 
         if "ERROR" in line or "Failed" in line or "error" in line.lower():
             sys.stderr.write(f"rclone: {line}\n")
 
+    # ── 主读取循环 ──
     while True:
-        # 用 select 多路复用等待 stderr/stdout 可读，1 秒超时
-        # 这样既不会阻塞卡死，也能每秒检查进程状态
-        readable, _, _ = select.select([stderr_fd, stdout_fd], [], [], 1.0)
+        readable, _, _ = select.select([err_fd, stdout_fd], [], [], 1.0)
 
         got_data = False
 
-        # 读取 stderr（rclone --progress 的输出在 stderr）
-        if stderr_fd in readable:
+        # 读取 stderr（rclone --progress 输出在 stderr）
+        if err_fd in readable:
             try:
-                chunk = os.read(stderr_fd, 65536).decode("utf-8", errors="replace")
+                chunk = os.read(err_fd, 65536)
                 if chunk:
                     got_data = True
-                    stderr_buffer += chunk
+                    stderr_buffer += chunk.decode("utf-8", errors="replace")
                     # 按 \r 或 \n 分割成行（rclone --progress 用 \r 刷新进度）
                     parts = re.split(r"[\r\n]+", stderr_buffer)
                     stderr_buffer = parts[-1]  # 最后一段可能不完整，保留
                     for part in parts[:-1]:
                         process_line(part)
             except BlockingIOError:
+                pass
+            except OSError:
+                # pty 在 EOF 时抛 OSError (EIO on Linux)
+                # 视为已读完，不设 got_data
                 pass
 
         # 排空 stdout（防止 stdout 缓冲区满导致 rclone 阻塞）
@@ -312,19 +378,24 @@ def upload_file(
                     text = chunk.decode("utf-8", errors="replace").strip()
                     if text:
                         sys.stderr.write(f"rclone stdout: {text}\n")
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 pass
 
         # 进程结束且无更多数据可读时退出
-        # （got_data=False 表示所有管道已到 EOF，数据已全部读取完毕）
         if proc.poll() is not None and not got_data:
-            # 处理缓冲区中最后的残留数据
             if stderr_buffer.strip():
                 process_line(stderr_buffer)
                 stderr_buffer = ""
             break
 
     proc.wait()
+
+    # 清理 pty master
+    if use_pty:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
 
     if proc.returncode == 0:
         emit_progress(PROGRESS_SCALE)
@@ -438,3 +509,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
